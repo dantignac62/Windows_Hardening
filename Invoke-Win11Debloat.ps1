@@ -23,7 +23,7 @@
     Log file path. Default: .\Logs\Invoke-Win11Debloat.log
 
 .NOTES
-    Version : 4.0.0 | Date: 2026-04-19
+    Version : 4.0.1 | Date: 2026-04-20
     Target  : Windows 11 Enterprise 25H2 (Build 26200.x+)
     Log Format: CMTrace-compatible
     Changes :
@@ -130,6 +130,7 @@ $AppxProtectList = @(
     'Windows.CBSPreview'
     'Windows.PrintDialog'
 
+
     # --- Framework runtimes (in-use / dependency-locked) ---
     'Microsoft.Windows.AugLoop.CBS'
     'Microsoft.WindowsAppRuntime.*'                 # 1.6/1.7/1.8/CBS family
@@ -157,6 +158,11 @@ $AppxAllowList = @(
     'MicrosoftCorporationII.QuickAssist'            # helpdesk remote assist
     'Microsoft.OneDriveSync'                        # inbox OneDrive sync (25H2+)
     'Microsoft.Winget.Source'                       # winget source cache
+    # v4.0.1: System AppX GUIDs that throw 0x80070032 on Build 26200
+    '1527c705-839a-4832-9118-54d4Bd6a0c89'     # FilePicker
+    'c5e2524a-ea46-4f67-841f-6a9465d9d515'     # FileExplorer
+    'E2A4F912-2574-4A75-9BB0-0D023378592B'     # AppResolverUX
+    'F46D4000-FD22-4DB4-AC8E-4E1DDDE828FE'     # AddSuggestedFoldersToLibraryDialog
 )
 
 try {
@@ -240,11 +246,12 @@ Write-LogSection 'Phase 2: Disable Optional Features'
 #   MicrosoftWindowsPowerShellV2Root, MicrosoftWindowsPowerShellV2
 #   (PS 2.0 engine removed from OS), Internet-Explorer-Optional-amd64.
 # SMB1 and XPS retained - may not be already-disabled on pristine images.
+# v4.0.1: Removed features already disabled on pristine 25H2 26200:
+#   SMB1Protocol, SMB1Protocol-Client, SMB1Protocol-Server,
+#   Printing-XPSServices-Features.
 $FeaturesToDisable = @(
-    'SMB1Protocol'; 'SMB1Protocol-Client'; 'SMB1Protocol-Server'
     'WindowsMediaPlayer'
     'WorkFolders-Client'
-    'Printing-XPSServices-Features'
 )
 
 foreach ($feature in $FeaturesToDisable) {
@@ -278,6 +285,9 @@ foreach ($feature in $FeaturesToDisable) {
 # ===========================================================================
 Write-LogSection 'Phase 3: Disable Consumer Services'
 
+# v4.0.1: Removed services not installed or already disabled on 25H2 26200:
+#   WMPNetworkSvc (not installed), Fax (not installed),
+#   RemoteRegistry (already disabled by default).
 $ServicesToDisable = @(
     @{ Name = 'XblAuthManager';   Desc = 'Xbox Live Auth Manager' }
     @{ Name = 'XblGameSave';      Desc = 'Xbox Live Game Save' }
@@ -288,9 +298,6 @@ $ServicesToDisable = @(
     @{ Name = 'MapsBroker';       Desc = 'Downloaded Maps Manager' }
     @{ Name = 'lfsvc';            Desc = 'Geolocation Service' }
     @{ Name = 'RetailDemo';       Desc = 'Retail Demo Service' }
-    @{ Name = 'WMPNetworkSvc';    Desc = 'WMP Network Sharing' }
-    @{ Name = 'Fax';              Desc = 'Fax' }
-    @{ Name = 'RemoteRegistry';   Desc = 'Remote Registry' }
 )
 
 foreach ($svc in $ServicesToDisable) {
@@ -333,7 +340,7 @@ foreach ($task in @(
     '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator'
     '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip'
     '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
-    '\Microsoft\Windows\Maps\MapsUpdateTask'
+    # v4.0.1: Removed MapsUpdateTask (already disabled on 25H2 26200).
     '\Microsoft\Windows\Maps\MapsToastTask'
     '\Microsoft\Windows\Shell\FamilySafetyMonitor'
     '\Microsoft\Windows\Shell\FamilySafetyRefreshTask'

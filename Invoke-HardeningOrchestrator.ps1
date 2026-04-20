@@ -505,32 +505,34 @@ $updatePolicy = [ordered]@{
     RebootReasons  = if ($patchSummary -and $patchSummary.PSObject.Properties.Name -contains 'RebootReasons') { @($patchSummary.RebootReasons) } else { @() }
 }
 
-$artifact = [ordered]@{
-    GeneratedUtc        = $runEnd.ToString('o')
-    OrchestratorVersion = '1.3.0'
-    Baseline            = 'CIS Microsoft Windows 11 Enterprise Benchmark v5.0.0 L1'
-    HitrustCsfRefs      = @(
-        '01.x Access Control',
-        '09.x Communications and Operations Management',
-        '10.x Information Systems Acquisition, Development, and Maintenance'
-    )
-    RunStartUtc         = $runStart.ToString('o')
-    RunEndUtc           = $runEnd.ToString('o')
-    RunDurationSec      = [math]::Round(($runEnd - $runStart).TotalSeconds, 2)
-    HaltedForReboot     = $haltedForReboot
-    SkippedStages       = @($skippedStages)
-    UpdatePolicy        = $updatePolicy
-    Host                = $preHost
-    Pipeline            = @($results)
-    PreRunState         = $preState
-    PostRunState        = $postState
-    StateDelta          = $stateDelta
-}
+# Build artifact incrementally. PS 5.1 reports the opening line of
+# [ordered]@{} for ANY error in the value expressions, making monolithic
+# hashtable literals impossible to debug. Incremental .Add() gives each
+# assignment its own traceable line number.
+$artifact = [ordered]@{}
+$artifact['GeneratedUtc']        = $runEnd.ToString('o')
+$artifact['OrchestratorVersion'] = '1.3.0'
+$artifact['Baseline']            = 'CIS Microsoft Windows 11 Enterprise Benchmark v5.0.0 L1'
+$artifact['HitrustCsfRefs']      = @('01.x Access Control','09.x Communications and Operations Management','10.x Information Systems Acquisition, Development, and Maintenance')
+$artifact['RunStartUtc']         = $runStart.ToString('o')
+$artifact['RunEndUtc']           = $runEnd.ToString('o')
+$artifact['RunDurationSec']      = [math]::Round(($runEnd - $runStart).TotalSeconds, 2)
+$artifact['HaltedForReboot']     = $haltedForReboot
+$artifact['SkippedStages']       = $skippedStages.ToArray()
+$artifact['UpdatePolicy']        = $updatePolicy
+$artifact['Host']                = $preHost
+$artifact['Pipeline']            = $results.ToArray()
+$artifact['PreRunState']         = $preState
+$artifact['PostRunState']        = $postState
+$artifact['StateDelta']          = $stateDelta
 
 $jsonPath = Join-Path $evidenceDir 'report.json'
 $mdPath   = Join-Path $evidenceDir 'report.md'
 
-$artifact | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+# Use -InputObject to serialize the OrderedDictionary as a whole. Piping
+# an OrderedDictionary through the pipeline enumerates its DictionaryEntry
+# objects in PS 5.1, producing per-entry JSON fragments instead of one object.
+ConvertTo-Json -InputObject $artifact -Depth 12 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
 
 # Markdown rendering -------------------------------------------------------
 $md = New-Object System.Collections.Generic.List[string]
@@ -696,7 +698,7 @@ if ($haltedForReboot) {
     exit 2
 }
 
-$failed = @($results | Where-Object { $_.Status -ne 'OK' })
+$failed = @($results.ToArray() | Where-Object { $_.Status -ne 'OK' })
 if ($failed.Count -gt 0) {
     Write-Host "  Investigate failures before sysprep /generalize /oobe /shutdown." -ForegroundColor Yellow
     exit 1
