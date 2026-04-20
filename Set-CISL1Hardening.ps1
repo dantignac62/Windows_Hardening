@@ -79,7 +79,7 @@ Set-HardenedRegistry -Path "$Lsa\MSV1_0"  -Name 'AllowNullSessionFallback' -Valu
 Set-HardenedRegistry -Path $Lsa           -Name 'UseMachineId'              -Value 1 -CISRef '2.3.11.2' -Description 'Computer identity for NTLM'
 Set-HardenedRegistry -Path "$Lsa\pku2u"   -Name 'AllowOnlineID'             -Value 0 -CISRef '2.3.11.3' -Description 'Disable PKU2U'
 Set-HardenedRegistry -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters' `
-    -Name 'SupportedEncryptionTypes' -Value 2147483644 -CISRef '2.3.11.4' -Description 'Kerberos: AES only (no DES/RC4)'
+    -Name 'SupportedEncryptionTypes' -Value 2147483640 -CISRef '2.3.11.4' -Description 'Kerberos: AES only (no DES/RC4)'
 Set-HardenedRegistry -Path $Lsa          -Name 'LmCompatibilityLevel' -Value 5         -CISRef '2.3.11.5' -Description 'NTLMv2 only; refuse LM/NTLM'
 Set-HardenedRegistry -Path "HKLM:\SYSTEM\$CS\Services\LDAP" -Name 'LDAPClientIntegrity' -Value 2 -CISRef '2.3.11.6' -Description 'LDAP: Require signing'
 Set-HardenedRegistry -Path "$Lsa\MSV1_0" -Name 'NTLMMinClientSec'     -Value 537395200 -CISRef '2.3.11.7' -Description 'NTLM client: NTLMv2+128-bit'
@@ -130,7 +130,7 @@ foreach ($s in $CISServices) {
 # ===========================================================================
 Write-LogSection 'Section 9: Firewall'
 $fw = 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall'
-foreach ($pr in @(@{P='DomainProfile';C='9.1'},@{P='StandardProfile';C='9.2'},@{P='PublicProfile';C='9.3'})) {
+foreach ($pr in @(@{P='DomainProfile';C='9.1'},@{P='PrivateProfile';C='9.2'},@{P='PublicProfile';C='9.3'})) {
     Set-HardenedRegistry -Path "$fw\$($pr.P)" -Name 'EnableFirewall'       -Value 1 -CISRef "$($pr.C).1" -Description "$($pr.P): ON"
     Set-HardenedRegistry -Path "$fw\$($pr.P)" -Name 'DefaultInboundAction' -Value 1 -CISRef "$($pr.C).2" -Description "$($pr.P) inbound: Block"
     Set-HardenedRegistry -Path "$fw\$($pr.P)" -Name 'DefaultOutboundAction' -Value 0 -CISRef "$($pr.C).3" -Description "$($pr.P) outbound: Allow"
