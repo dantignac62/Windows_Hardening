@@ -1,0 +1,11 @@
+# Runtime outputs
+Logs/
+Evidence/
+Mount/
+
+# Claude Code local workspace
+.claude/
+
+# Windows
+Thumbs.db
+desktop.ini
