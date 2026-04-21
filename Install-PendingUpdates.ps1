@@ -69,9 +69,14 @@
     CMTrace log path. Default: .\Logs\Install-PendingUpdates.log
 
 .NOTES
-    Version : 1.1.0 | Date: 2026-04-20
+    Version : 1.2.0 | Date: 2026-04-21
     Target  : Windows 11 Enterprise 25H2 (Build 26200.x+)
     Changes :
+      1.2.0 - Get-HotFix cross-check in Install-UpdatesFromWindowsUpdate:
+              builds an installed-KB set and skips any WUA result whose
+              KB is already present. Prevents redundant downloads/installs
+              when WUA's DataStore.edb is out of sync with packages DISM
+              applied offline.
       1.1.0 - Integrated with ImageHardeningLib.ps1 (Initialize-HardeningLog,
               Write-Log with uppercase levels). Removed inline Write-Log shim.
               Uses $script:ChangesFile / $script:LogFile from lib. Extended
@@ -286,6 +291,22 @@ function Install-UpdatesFromWindowsUpdate {
         return
     }
 
+    # WUA/HotFix cross-check: on offline-serviced images, WUA's DataStore.edb
+    # may not reflect packages DISM already applied, causing IsInstalled=0
+    # for KBs the OS already has. Get-HotFix reads Win32_QuickFixEngineering
+    # which reflects CBS reality. Get-WindowsPackage -Online is not useful
+    # here — the CU is stored as Package_for_RollupFix (no KB in the name).
+    $installedKBs = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase)
+    try {
+        foreach ($hf in @(Get-HotFix -ErrorAction Stop)) {
+            if ($hf.HotFixID) { [void]$installedKBs.Add($hf.HotFixID) }
+        }
+    } catch { }
+    if ($installedKBs.Count -gt 0) {
+        Write-Log "Installed KBs (HotFix cross-check): $($installedKBs.Count) ($($installedKBs -join ', '))"
+    }
+
     $allowedCategoryNames = switch ($Category) {
         'Security'            { @('Security Updates') }
         'Critical'            { @('Critical Updates') }
@@ -300,6 +321,15 @@ function Install-UpdatesFromWindowsUpdate {
         $kbFirst   = ($u.KBArticleIDs | Select-Object -First 1)
         $kbTarget  = if ($kbFirst) { "KB$kbFirst" } else { $u.Identity.UpdateID }
         $isPreview = $title -match '(?i)\bpreview\b'
+
+        # HotFix cross-check: skip if already installed (WUA stale).
+        if ($kbFirst -and $installedKBs.Contains("KB$kbFirst")) {
+            Write-Log "Skipped (already installed): $kbTarget - $title" -Level SKIP
+            Add-Ledger -Action VERIFIED -Category Patching -Target $kbTarget `
+                       -Description 'Already installed per Get-HotFix; WUA stale' `
+                       -Details @{ Title = $title }
+            continue
+        }
 
         if ($isPreview -and -not $IncludePreview) {
             Write-Log "Skipped (preview): $title" -Level SKIP
@@ -515,7 +545,7 @@ $sidecarPath = $script:LogFile -replace '\.log$', '.summary.json'
 $payload = [ordered]@{
     ScriptName     = 'Install-PendingUpdates'
     Component      = 'Install-PendingUpdates'
-    Version        = '1.1.0'
+    Version        = '1.2.0'
     Mode           = $mode
     FinishedUtc    = (Get-Date).ToUniversalTime().ToString('o')
     LogFile        = $script:LogFile

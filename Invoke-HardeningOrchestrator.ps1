@@ -8,9 +8,11 @@
 
 .DESCRIPTION
     Executes, in order:
-      0. Install-PendingUpdates.ps1  (sentinel-gated: runs once, writes
-         UpdatesFinished.txt, registers RunOnce, reboots. Skipped on
-         subsequent runs when the sentinel file exists.)
+      0. Install-PendingUpdates.ps1  (smart gate: reads Build.UBR,
+         queries WUA for pending Security/Critical updates. If current,
+         writes UpdatesFinished.txt and proceeds without reboot. If
+         updates needed, installs them, writes sentinel, registers
+         RunOnce, reboots. Skipped on re-run when sentinel exists.)
       1. Invoke-Win11Debloat.ps1
       2. Set-CISL1Hardening.ps1
       3. Set-CompanyCustomizations.ps1
@@ -47,14 +49,6 @@
         already at target), path, name, old/new value, CIS ref,
         description — read from each script's .changes.jsonl
 
-.PARAMETER EnableEncryption
-    Passed through to Set-BitLockerConfig. Enables BitLocker encryption
-    (Phase 2+3); requires a TPM.
-
-.PARAMETER SkipRecoveryBackup
-    Passed through to Set-BitLockerConfig. Skip Entra backup requirement
-    for disconnected builds.
-
 .PARAMETER Quiet
     Suppress child-script console output. Log files still written.
 
@@ -62,16 +56,25 @@
     Override for the evidence root. Default: .\Evidence
 
 .NOTES
-    Version : 1.4.0 | Date: 2026-04-20
+    Version : 1.6.0 | Date: 2026-04-21
     Target  : Windows 11 Enterprise 25H2 (Build 26200.x+)
     Changes :
+      1.6.0 - Stage 0: added Get-HotFix cross-check so KBs that DISM
+              slipstreamed (but WUA's DataStore.edb does not reflect)
+              are recognised as already installed. WUA criteria now
+              includes DeploymentAction='Installation' to align with
+              Install-PendingUpdates.ps1. Prevents false-positive patch
+              cycles on offline-serviced images booted into Audit Mode.
+      1.5.0 - Stage 0 smart gate: reads Build.UBR, queries WUA for
+              pending Security/Critical updates before deciding to
+              patch. If system is current, writes sentinel and
+              proceeds directly to hardening (no reboot). If updates
+              installed but no reboot needed, also proceeds without
+              reboot. Reboot + RunOnce only when WUA reports
+              RebootRequired.
       1.4.0 - Replaced SkipPatching/reboot-halt with sentinel file
-              (UpdatesFinished.txt) + RunOnce registry entry. Stage 0
-              runs once, writes sentinel, registers RunOnce, reboots.
-              After reboot, orchestrator re-launches via RunOnce and
-              skips patching. Added Set-CompanyCustomizations.ps1 as
-              stage 3. Removed params: SkipPatching, MsuSourcePath,
-              MinBuildUbr, UpdateCategory, IncludePreview.
+              (UpdatesFinished.txt) + RunOnce registry entry.
+              Added Set-CompanyCustomizations.ps1 as stage 3.
       1.3.0 - Added Install-PendingUpdates.ps1 as stage 0.
               Silent-failure promotion: Status=Failed when child exits
               cleanly but summary.Counters.Errors > 0.
@@ -83,8 +86,6 @@
 
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [switch]$EnableEncryption,
-    [switch]$SkipRecoveryBackup,
     [switch]$Quiet,
     [string]$EvidencePath
 )
@@ -327,23 +328,104 @@ function Get-StateDelta {
     return ,$deltas.ToArray()
 }
 
-# ---------- Stage 0: Patching (sentinel-gated) -----------------------------
+# ---------- Stage 0: Patching (smart gate) ---------------------------------
 #
-# If UpdatesFinished.txt exists in $PSScriptRoot, patching is skipped.
-# Otherwise: run Install-PendingUpdates.ps1, write the sentinel, register
-# a RunOnce entry, and reboot. After reboot, the orchestrator re-launches
-# via RunOnce, finds the sentinel, and proceeds to the hardening stages.
+# Flow:
+#   1. If UpdatesFinished.txt exists -> skip patching, proceed to hardening.
+#   2. Otherwise read Build.UBR, query WUA for pending Security/Critical
+#      updates. If none -> write sentinel, proceed to hardening (no reboot).
+#   3. If updates found -> run Install-PendingUpdates.ps1, write sentinel,
+#      register RunOnce, reboot. After reboot, orchestrator re-launches
+#      via RunOnce, finds sentinel, proceeds to hardening.
 
-$sentinelFile    = Join-Path $PSScriptRoot 'UpdatesFinished.txt'
-$patchScript     = Join-Path $PSScriptRoot 'Install-PendingUpdates.ps1'
+$sentinelFile = Join-Path $PSScriptRoot 'UpdatesFinished.txt'
+$patchScript  = Join-Path $PSScriptRoot 'Install-PendingUpdates.ps1'
+
 if (-not (Test-Path -LiteralPath $sentinelFile)) {
-    Write-Host '' 
-    Write-Host '  Stage 0: Patching (UpdatesFinished.txt not found)' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  Stage 0: Patching' -ForegroundColor Cyan
     Write-Host ''
 
-    if (-not (Test-Path -LiteralPath $patchScript)) {
-        Write-Host "  [MISSING] Install-PendingUpdates.ps1" -ForegroundColor Red
+    # Read current Build.UBR
+    $cvPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $curBuild = (Get-ItemProperty -Path $cvPath -Name CurrentBuild -EA SilentlyContinue).CurrentBuild
+    $curUbr   = (Get-ItemProperty -Path $cvPath -Name UBR -EA SilentlyContinue).UBR
+    $buildUbr = if ($curBuild -and $curUbr) { "$curBuild.$curUbr" } else { 'unknown' }
+    Write-Host "  Current Build.UBR: $buildUbr" -ForegroundColor White
+
+    # Query WUA for pending Security + Critical updates
+    $pendingCount = 0
+    try {
+        # Build a set of KBs the OS already has, via Get-HotFix.
+        # On offline-serviced images WUA's DataStore.edb may lag behind
+        # the actual CBS state, reporting IsInstalled=0 for KBs already
+        # present. Get-HotFix reads the Win32_QuickFixEngineering WMI
+        # class, which reflects CBS reality regardless of WUA sync state.
+        # Note: Get-WindowsPackage -Online is NOT useful here — the CU
+        # is stored as Package_for_RollupFix (no KB in the name), so a
+        # KB-regex match would miss it entirely.
+        $installedKBs = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase)
+        try {
+            foreach ($hf in @(Get-HotFix -ErrorAction Stop)) {
+                if ($hf.HotFixID) { [void]$installedKBs.Add($hf.HotFixID) }
+            }
+        } catch { }
+        if ($installedKBs.Count -gt 0) {
+            Write-Host "  Installed KBs (HotFix): $($installedKBs.Count) ($($installedKBs -join ', '))" -ForegroundColor DarkGray
+        }
+
+        $session  = New-Object -ComObject Microsoft.Update.Session
+        $searcher = $session.CreateUpdateSearcher()
+        $searcher.ServerSelection = 2  # ssWindowsUpdate (public WU)
+        # DeploymentAction='Installation' aligns with Install-PendingUpdates.ps1
+        # and excludes updates WUA has detected but not yet offered for install.
+        $criteria = "IsInstalled=0 and IsHidden=0 and DeploymentAction='Installation' and Type='Software'"
+        $wuResult = $searcher.Search($criteria)
+
+        # Filter to Security + Critical only (match the orchestrator's intent)
+        foreach ($u in $wuResult.Updates) {
+            $cats = @($u.Categories | ForEach-Object { $_.Name })
+            $isPreview = [string]$u.Title -match '(?i)\bpreview\b'
+            if (-not $isPreview -and ($cats -contains 'Security Updates' -or $cats -contains 'Critical Updates')) {
+                $kbId = ($u.KBArticleIDs | Select-Object -First 1)
+                $kbLabel = if ($kbId) { "KB$kbId" } else { $u.Identity.UpdateID }
+
+                # Cross-check: if Get-HotFix already has this KB, WUA is stale.
+                if ($kbId -and $installedKBs.Contains("KB$kbId")) {
+                    Write-Host "  Already installed: $kbLabel - WUA stale, skipping" -ForegroundColor DarkGray
+                    continue
+                }
+
+                $pendingCount++
+                Write-Host "  Pending: $kbLabel - $($u.Title)" -ForegroundColor Yellow
+            }
+        }
+    }
+    catch {
+        Write-Host "  [WARN] WUA query failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "  Falling back to running Install-PendingUpdates.ps1 unconditionally." -ForegroundColor Yellow
+        $pendingCount = -1  # force patching on query failure
+    }
+
+    if ($pendingCount -eq 0) {
+        # System is current. Write sentinel and proceed to hardening (no reboot).
+        Write-Host "  System is current at Build.UBR $buildUbr. No pending Security/Critical updates." -ForegroundColor Green
+        "No updates needed. Build.UBR=$buildUbr at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" |
+            Set-Content -LiteralPath $sentinelFile -Encoding UTF8 -Force
+        Write-Host "  Written: $sentinelFile" -ForegroundColor Green
+
     } else {
+        # Updates available (or query failed). Run the patching script.
+        if ($pendingCount -gt 0) {
+            Write-Host "  $pendingCount Security/Critical update(s) pending. Installing..." -ForegroundColor Cyan
+        }
+
+        if (-not (Test-Path -LiteralPath $patchScript)) {
+            Write-Host "  [MISSING] Install-PendingUpdates.ps1" -ForegroundColor Red
+            exit 1
+        }
+
         $patchArgs = @{ RebootBehavior = 'DetectOnly' }
         if ($Quiet) { $patchArgs['Quiet'] = $true }
         & $patchScript @patchArgs
@@ -351,33 +433,41 @@ if (-not (Test-Path -LiteralPath $sentinelFile)) {
         $patchSummary = Get-ScriptSummary -ScriptPath $patchScript
         $patchFailed  = $patchSummary -and $patchSummary.Counters -and ([int]$patchSummary.Counters.Errors -gt 0)
 
-        if (-not $patchFailed) {
-            # Write sentinel
-            "Updates completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" |
-                Set-Content -LiteralPath $sentinelFile -Encoding UTF8 -Force
-            Write-Host "  Written: $sentinelFile" -ForegroundColor Green
+        if ($patchFailed) {
+            Write-Host '  [ERR] Patching reported errors. Fix before re-running.' -ForegroundColor Red
+            exit 1
+        }
 
-            # Register RunOnce to re-launch this orchestrator after reboot
-            $runOnceKey  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
-            $runOnceCmd  = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"'
-            if ($EnableEncryption)   { $runOnceCmd += ' -EnableEncryption' }
-            if ($SkipRecoveryBackup) { $runOnceCmd += ' -SkipRecoveryBackup' }
+        # Check if a reboot is actually needed (Install-PendingUpdates reports this)
+        $needsReboot = $patchSummary -and
+                        $patchSummary.PSObject.Properties.Name -contains 'RebootRequired' -and
+                        [bool]$patchSummary.RebootRequired
+
+        # Write sentinel
+        $afterUbr = (Get-ItemProperty -Path $cvPath -Name UBR -EA SilentlyContinue).UBR
+        $afterBuildUbr = if ($curBuild -and $afterUbr) { "$curBuild.$afterUbr" } else { 'unknown' }
+        "Updates completed. Build.UBR=$afterBuildUbr at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" |
+            Set-Content -LiteralPath $sentinelFile -Encoding UTF8 -Force
+        Write-Host "  Written: $sentinelFile" -ForegroundColor Green
+
+        if ($needsReboot) {
+            # Register RunOnce and reboot
+            $runOnceKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+            $runOnceCmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"'
             if ($Quiet)              { $runOnceCmd += ' -Quiet' }
             Set-ItemProperty -Path $runOnceKey -Name 'HardeningResume' -Value $runOnceCmd -Type String -Force
             Write-Host '  Registered RunOnce: HardeningResume' -ForegroundColor Green
 
-            # Reboot
             Write-Host ''
             Write-Host '  Rebooting in 15 seconds to apply updates...' -ForegroundColor Yellow
             Write-Host '  After reboot, hardening resumes automatically via RunOnce.' -ForegroundColor Yellow
             Start-Sleep -Seconds 15
             Restart-Computer -Force
         } else {
-            Write-Host '  [ERR] Patching reported errors. Fix before re-running.' -ForegroundColor Red
-            exit 1
+            # Updates installed but no reboot needed. Proceed to hardening.
+            Write-Host "  Updates applied. Build.UBR now $afterBuildUbr. No reboot required." -ForegroundColor Green
         }
     }
-    exit 0
 } else {
     Write-Host ''
     Write-Host "  Stage 0: Patching skipped (UpdatesFinished.txt found)" -ForegroundColor DarkGray
@@ -390,7 +480,7 @@ $pipeline = @(
     @{ Name = 'Set-CISL1Hardening.ps1';       Args = @{} }
     @{ Name = 'Set-CompanyCustomizations.ps1'; Args = @{} }
     @{ Name = 'Set-CipherSuiteHardening.ps1'; Args = @{} }
-    @{ Name = 'Set-BitLockerConfig.ps1'      ; Args = @{ EnableEncryption = $EnableEncryption; SkipRecoveryBackup = $SkipRecoveryBackup } }
+    @{ Name = 'Set-BitLockerConfig.ps1';       Args = @{} }
 )
 
 $common = @{ Quiet = $Quiet }
@@ -495,7 +585,7 @@ $updatePolicy['BuildUbrAfter']  = if ($patchSummary) { [string]$patchSummary.Bui
 # assignment its own traceable line number.
 $artifact = [ordered]@{}
 $artifact['GeneratedUtc']        = $runEnd.ToString('o')
-$artifact['OrchestratorVersion'] = '1.4.0'
+$artifact['OrchestratorVersion'] = '1.6.0'
 $artifact['Baseline']            = 'CIS Microsoft Windows 11 Enterprise Benchmark v5.0.0 L1'
 $artifact['HitrustCsfRefs']      = @('01.x Access Control','09.x Communications and Operations Management','10.x Information Systems Acquisition, Development, and Maintenance')
 $artifact['RunStartUtc']         = $runStart.ToString('o')
