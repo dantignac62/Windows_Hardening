@@ -8,22 +8,21 @@
 
 .DESCRIPTION
     Executes, in order:
-      0. Install-PendingUpdates.ps1  (skippable with -SkipPatching)
+      0. Install-PendingUpdates.ps1  (sentinel-gated: runs once, writes
+         UpdatesFinished.txt, registers RunOnce, reboots. Skipped on
+         subsequent runs when the sentinel file exists.)
       1. Invoke-Win11Debloat.ps1
       2. Set-CISL1Hardening.ps1
-      3. Set-CipherSuiteHardening.ps1
-      4. Set-BitLockerConfig.ps1
+      3. Set-CompanyCustomizations.ps1
+      4. Set-CipherSuiteHardening.ps1
+      5. Set-BitLockerConfig.ps1
 
     A failure in one script is logged and the next still runs (failures
-    do not abort the pipeline) - each area lands independently. Exception:
-    if Install-PendingUpdates.ps1 installs updates requiring a reboot, the
-    pipeline halts immediately after the patching stage. The evidence
-    artifact is still written. Operator reboots and re-runs.
+    do not abort the pipeline) - each area lands independently.
 
     Each child script writes its own CMTrace log under .\Logs\; this wrapper
     prints a combined per-script pass/fail summary, writes an evidence
-    artifact, and exits non-zero if any child reported an error or if the
-    pipeline halted for reboot.
+    artifact, and exits non-zero if any child reported an error.
 
     Artifact location:  .\Evidence\<yyyyMMdd_HHmmss>\report.{json,md}
 
@@ -34,8 +33,8 @@
       - Per-script execution: status, start/end UTC, duration, log path,
         log SHA256, counters (Applied/Skipped/Warned/Errors) read from
         each script's sidecar summary file
-      - UpdatePolicy: patching mode, MinBuildUbr gate, KBs applied/failed,
-        Build.UBR before and after, RebootRequired
+      - UpdatePolicy: sentinel file state, KBs applied/failed,
+        Build.UBR before and after
       - Pre-run and post-run state snapshots (same shape, taken from the
         running OS before and after the pipeline):
           Firewall profiles, BitLocker volume protection+method,
@@ -56,25 +55,6 @@
     Passed through to Set-BitLockerConfig. Skip Entra backup requirement
     for disconnected builds.
 
-.PARAMETER SkipPatching
-    Omit Install-PendingUpdates.ps1. Use when the base VM was patched
-    out-of-band before the orchestrator runs.
-
-.PARAMETER MsuSourcePath
-    Passed to Install-PendingUpdates. Folder of pre-downloaded MSU/CAB
-    packages; bypasses Windows Update when set.
-
-.PARAMETER MinBuildUbr
-    Passed to Install-PendingUpdates. Pre-flight gate: if the running OS
-    is already at or above this Build.UBR (e.g. '26200.8246'), WUA is
-    skipped and a VERIFIED event is recorded.
-
-.PARAMETER UpdateCategory
-    Passed to Install-PendingUpdates. Default: SecurityAndCritical.
-
-.PARAMETER IncludePreview
-    Passed to Install-PendingUpdates. Include preview CUs in WUA results.
-
 .PARAMETER Quiet
     Suppress child-script console output. Log files still written.
 
@@ -82,13 +62,17 @@
     Override for the evidence root. Default: .\Evidence
 
 .NOTES
-    Version : 1.3.0 | Date: 2026-04-20
+    Version : 1.4.0 | Date: 2026-04-20
     Target  : Windows 11 Enterprise 25H2 (Build 26200.x+)
     Changes :
-      1.3.0 - Added Install-PendingUpdates.ps1 as stage 0 with reboot-
-              required halt. New params: SkipPatching, MsuSourcePath,
-              MinBuildUbr, UpdateCategory, IncludePreview. Artifact now
-              includes UpdatePolicy, HaltedForReboot, SkippedStages.
+      1.4.0 - Replaced SkipPatching/reboot-halt with sentinel file
+              (UpdatesFinished.txt) + RunOnce registry entry. Stage 0
+              runs once, writes sentinel, registers RunOnce, reboots.
+              After reboot, orchestrator re-launches via RunOnce and
+              skips patching. Added Set-CompanyCustomizations.ps1 as
+              stage 3. Removed params: SkipPatching, MsuSourcePath,
+              MinBuildUbr, UpdateCategory, IncludePreview.
+      1.3.0 - Added Install-PendingUpdates.ps1 as stage 0.
               Silent-failure promotion: Status=Failed when child exits
               cleanly but summary.Counters.Errors > 0.
       1.2.0 - Added PreRunState, StateDelta, ChangeLedger.
@@ -101,12 +85,6 @@
 param(
     [switch]$EnableEncryption,
     [switch]$SkipRecoveryBackup,
-    [switch]$SkipPatching,
-    [string]$MsuSourcePath,
-    [string]$MinBuildUbr,
-    [ValidateSet('Security','Critical','SecurityAndCritical','All')]
-    [string]$UpdateCategory = 'SecurityAndCritical',
-    [switch]$IncludePreview,
     [switch]$Quiet,
     [string]$EvidencePath
 )
@@ -349,24 +327,68 @@ function Get-StateDelta {
     return ,$deltas.ToArray()
 }
 
-# ---------- Pipeline -------------------------------------------------------
+# ---------- Stage 0: Patching (sentinel-gated) -----------------------------
+#
+# If UpdatesFinished.txt exists in $PSScriptRoot, patching is skipped.
+# Otherwise: run Install-PendingUpdates.ps1, write the sentinel, register
+# a RunOnce entry, and reboot. After reboot, the orchestrator re-launches
+# via RunOnce, finds the sentinel, and proceeds to the hardening stages.
 
-$pipeline = @()
-if (-not $SkipPatching) {
-    $pipeline += @{
-        Name = 'Install-PendingUpdates.ps1'
-        Args = @{
-            MsuSourcePath  = $MsuSourcePath
-            MinBuildUbr    = $MinBuildUbr
-            Category       = $UpdateCategory
-            IncludePreview = $IncludePreview
-            RebootBehavior = 'DetectOnly'   # orchestrator owns the halt decision
+$sentinelFile    = Join-Path $PSScriptRoot 'UpdatesFinished.txt'
+$patchScript     = Join-Path $PSScriptRoot 'Install-PendingUpdates.ps1'
+if (-not (Test-Path -LiteralPath $sentinelFile)) {
+    Write-Host '' 
+    Write-Host '  Stage 0: Patching (UpdatesFinished.txt not found)' -ForegroundColor Cyan
+    Write-Host ''
+
+    if (-not (Test-Path -LiteralPath $patchScript)) {
+        Write-Host "  [MISSING] Install-PendingUpdates.ps1" -ForegroundColor Red
+    } else {
+        $patchArgs = @{ RebootBehavior = 'DetectOnly' }
+        if ($Quiet) { $patchArgs['Quiet'] = $true }
+        & $patchScript @patchArgs
+
+        $patchSummary = Get-ScriptSummary -ScriptPath $patchScript
+        $patchFailed  = $patchSummary -and $patchSummary.Counters -and ([int]$patchSummary.Counters.Errors -gt 0)
+
+        if (-not $patchFailed) {
+            # Write sentinel
+            "Updates completed: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" |
+                Set-Content -LiteralPath $sentinelFile -Encoding UTF8 -Force
+            Write-Host "  Written: $sentinelFile" -ForegroundColor Green
+
+            # Register RunOnce to re-launch this orchestrator after reboot
+            $runOnceKey  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce'
+            $runOnceCmd  = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"'
+            if ($EnableEncryption)   { $runOnceCmd += ' -EnableEncryption' }
+            if ($SkipRecoveryBackup) { $runOnceCmd += ' -SkipRecoveryBackup' }
+            if ($Quiet)              { $runOnceCmd += ' -Quiet' }
+            Set-ItemProperty -Path $runOnceKey -Name 'HardeningResume' -Value $runOnceCmd -Type String -Force
+            Write-Host '  Registered RunOnce: HardeningResume' -ForegroundColor Green
+
+            # Reboot
+            Write-Host ''
+            Write-Host '  Rebooting in 15 seconds to apply updates...' -ForegroundColor Yellow
+            Write-Host '  After reboot, hardening resumes automatically via RunOnce.' -ForegroundColor Yellow
+            Start-Sleep -Seconds 15
+            Restart-Computer -Force
+        } else {
+            Write-Host '  [ERR] Patching reported errors. Fix before re-running.' -ForegroundColor Red
+            exit 1
         }
     }
+    exit 0
+} else {
+    Write-Host ''
+    Write-Host "  Stage 0: Patching skipped (UpdatesFinished.txt found)" -ForegroundColor DarkGray
 }
-$pipeline += @(
+
+# ---------- Hardening Pipeline (stages 1-5) --------------------------------
+
+$pipeline = @(
     @{ Name = 'Invoke-Win11Debloat.ps1';      Args = @{} }
     @{ Name = 'Set-CISL1Hardening.ps1';       Args = @{} }
+    @{ Name = 'Set-CompanyCustomizations.ps1'; Args = @{} }
     @{ Name = 'Set-CipherSuiteHardening.ps1'; Args = @{} }
     @{ Name = 'Set-BitLockerConfig.ps1'      ; Args = @{ EnableEncryption = $EnableEncryption; SkipRecoveryBackup = $SkipRecoveryBackup } }
 )
@@ -376,33 +398,12 @@ if ($WhatIfPreference) { $common['WhatIf'] = $true }
 
 $results         = New-Object System.Collections.Generic.List[object]
 $skippedStages   = New-Object System.Collections.Generic.List[string]
-$haltedForReboot = $false
 $preHost    = Get-HostSnapshot
 Write-Host '  Capturing pre-run state snapshot...' -ForegroundColor Cyan
 $preState   = Get-SystemStateSnapshot
 $runStart   = (Get-Date).ToUniversalTime()
 
 foreach ($step in $pipeline) {
-    # Once halted for reboot, record remaining stages as skipped without running.
-    if ($haltedForReboot) {
-        $skippedStages.Add($step.Name)
-        $results.Add([pscustomobject]@{
-            Script        = $step.Name
-            Status        = 'Skipped-RebootRequired'
-            StartUtc      = $null
-            EndUtc        = $null
-            DurationSec   = 0
-            LogPath       = $null
-            LogSha256     = $null
-            ChangesPath   = $null
-            ChangesSha256 = $null
-            Counters      = $null
-            ChangeLedger  = @()
-            Error         = 'Halted: pending reboot from patching stage.'
-        })
-        continue
-    }
-
     $path = Join-Path $PSScriptRoot $step.Name
     $startUtc = (Get-Date).ToUniversalTime()
 
@@ -467,17 +468,6 @@ foreach ($step in $pipeline) {
         Error          = $err
     })
 
-    # Halt if patching installed updates that require a reboot before servicing
-    # can continue safely. Evidence artifact is still written below.
-    if ($step.Name -eq 'Install-PendingUpdates.ps1' `
-        -and $summary `
-        -and $summary.PSObject.Properties.Name -contains 'RebootRequired' `
-        -and [bool]$summary.RebootRequired) {
-        $haltedForReboot = $true
-        Write-Host ''
-        Write-Host '  Patching installed updates that require a reboot. Halting pipeline.' -ForegroundColor Yellow
-        Write-Host '  Action: reboot the VM, then re-run this orchestrator to continue.' -ForegroundColor Yellow
-    }
 }
 
 $runEnd = (Get-Date).ToUniversalTime()
@@ -490,20 +480,14 @@ $postState = Get-SystemStateSnapshot
 $stateDelta = Get-StateDelta -Before $preState -After $postState
 
 $patchSummary = Get-ScriptSummary -ScriptPath (Join-Path $PSScriptRoot 'Install-PendingUpdates.ps1')
-$updatePolicy = [ordered]@{
-    Skipped        = [bool]$SkipPatching
-    MsuSourcePath  = $MsuSourcePath
-    MinBuildUbr    = $MinBuildUbr
-    Category       = $UpdateCategory
-    IncludePreview = [bool]$IncludePreview
-    Mode           = if ($patchSummary) { [string]$patchSummary.Mode } else { $null }
-    KbsApplied     = if ($patchSummary) { @($patchSummary.KbsApplied) } else { @() }
-    KbsFailed      = if ($patchSummary) { @($patchSummary.KbsFailed)  } else { @() }
-    BuildUbrBefore = if ($patchSummary) { [string]$patchSummary.BuildUbrBefore } else { $null }
-    BuildUbrAfter  = if ($patchSummary) { [string]$patchSummary.BuildUbrAfter  } else { $null }
-    RebootRequired = [bool]$haltedForReboot
-    RebootReasons  = if ($patchSummary -and $patchSummary.PSObject.Properties.Name -contains 'RebootReasons') { @($patchSummary.RebootReasons) } else { @() }
-}
+$updatePolicy = [ordered]@{}
+$updatePolicy['SentinelFile']   = $sentinelFile
+$updatePolicy['PatchingRanPriorToReboot'] = (Test-Path -LiteralPath $sentinelFile)
+$updatePolicy['Mode']           = if ($patchSummary) { [string]$patchSummary.Mode } else { $null }
+$updatePolicy['KbsApplied']     = if ($patchSummary) { @($patchSummary.KbsApplied) } else { @() }
+$updatePolicy['KbsFailed']      = if ($patchSummary) { @($patchSummary.KbsFailed)  } else { @() }
+$updatePolicy['BuildUbrBefore'] = if ($patchSummary) { [string]$patchSummary.BuildUbrBefore } else { $null }
+$updatePolicy['BuildUbrAfter']  = if ($patchSummary) { [string]$patchSummary.BuildUbrAfter  } else { $null }
 
 # Build artifact incrementally. PS 5.1 reports the opening line of
 # [ordered]@{} for ANY error in the value expressions, making monolithic
@@ -511,14 +495,12 @@ $updatePolicy = [ordered]@{
 # assignment its own traceable line number.
 $artifact = [ordered]@{}
 $artifact['GeneratedUtc']        = $runEnd.ToString('o')
-$artifact['OrchestratorVersion'] = '1.3.0'
+$artifact['OrchestratorVersion'] = '1.4.0'
 $artifact['Baseline']            = 'CIS Microsoft Windows 11 Enterprise Benchmark v5.0.0 L1'
 $artifact['HitrustCsfRefs']      = @('01.x Access Control','09.x Communications and Operations Management','10.x Information Systems Acquisition, Development, and Maintenance')
 $artifact['RunStartUtc']         = $runStart.ToString('o')
 $artifact['RunEndUtc']           = $runEnd.ToString('o')
 $artifact['RunDurationSec']      = [math]::Round(($runEnd - $runStart).TotalSeconds, 2)
-$artifact['HaltedForReboot']     = $haltedForReboot
-$artifact['SkippedStages']       = $skippedStages.ToArray()
 $artifact['UpdatePolicy']        = $updatePolicy
 $artifact['Host']                = $preHost
 $artifact['Pipeline']            = $results.ToArray()
@@ -691,12 +673,6 @@ Write-Host ''
 Write-Host "  Evidence: $jsonPath"                 -ForegroundColor Cyan
 Write-Host "  Evidence: $mdPath"                   -ForegroundColor Cyan
 Write-Host ''
-
-if ($haltedForReboot) {
-    Write-Host '  Pipeline halted: patching requires a reboot before continuing.' -ForegroundColor Yellow
-    Write-Host '  Next: Restart-Computer, then re-run this orchestrator.' -ForegroundColor Yellow
-    exit 2
-}
 
 $failed = @($results.ToArray() | Where-Object { $_.Status -ne 'OK' })
 if ($failed.Count -gt 0) {

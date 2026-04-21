@@ -156,7 +156,7 @@ $AppxAllowList = @(
     'Microsoft.RawImageExtension'; 'Microsoft.VP9VideoExtensions'; 'Microsoft.AV1VideoExtension'
     # v3.0.1 additions
     'MicrosoftCorporationII.QuickAssist'            # helpdesk remote assist
-    'Microsoft.OneDriveSync'                        # inbox OneDrive sync (25H2+)
+    # v4.0.1: Removed Microsoft.OneDriveSync (company policy: OneDrive disabled)
     'Microsoft.Winget.Source'                       # winget source cache
     # v4.0.1: System AppX GUIDs that throw 0x80070032 on Build 26200
     '1527c705-839a-4832-9118-54d4Bd6a0c89'     # FilePicker
@@ -296,7 +296,7 @@ $ServicesToDisable = @(
     @{ Name = 'DiagTrack';        Desc = 'Connected User Experiences and Telemetry' }
     @{ Name = 'dmwappushservice'; Desc = 'WAP Push Message Routing' }
     @{ Name = 'MapsBroker';       Desc = 'Downloaded Maps Manager' }
-    @{ Name = 'lfsvc';            Desc = 'Geolocation Service' }
+    # lfsvc (Geolocation) removed: company policy requires auto-timezone
     @{ Name = 'RetailDemo';       Desc = 'Retail Demo Service' }
 )
 

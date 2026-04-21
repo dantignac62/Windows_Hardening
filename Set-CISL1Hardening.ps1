@@ -110,7 +110,8 @@ $CISServices = @(
     @{N='W3SVC';CIS='5.11';D='WWW'}; @{N='WMSvc';CIS='5.12';D='Web Mgmt'}
     @{N='WMPNetworkSvc';CIS='5.13';D='WMP Net'}; @{N='icssvc';CIS='5.14';D='Hotspot'}
     @{N='WpnService';CIS='5.15';D='Push Notifications'}; @{N='PushToInstall';CIS='5.16';D='PushToInstall'}
-    @{N='RemoteRegistry';CIS='5.17';D='Remote Registry'}; @{N='lfsvc';CIS='5.18';D='Geolocation'}
+    @{N='RemoteRegistry';CIS='5.17';D='Remote Registry'}
+    # 5.18 lfsvc (Geolocation) removed: company policy requires auto-timezone
 )
 
 foreach ($s in $CISServices) {
