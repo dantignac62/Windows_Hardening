@@ -385,7 +385,7 @@ Set-HardenedRegistry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudConte
 Set-HardenedRegistry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'     -Name 'DisableCloudOptimizedContent'   -Value 1 -Description 'Disable cloud-optimized content'
 Set-HardenedRegistry -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager' -Name 'SystemPaneSuggestionsEnabled' -Value 0 -Description 'Disable Start suggestions'
 Set-HardenedRegistry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo'  -Name 'DisabledByGroupPolicy'          -Value 1 -Description 'Disable Advertising ID'
-Set-HardenedRegistry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Copilot'  -Name 'TurnOffWindowsCopilot'          -Value 1 -Description 'Disable Windows Copilot'
+#Set-HardenedRegistry -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Copilot'  -Name 'TurnOffWindowsCopilot'          -Value 1 -Description 'Disable Windows Copilot'
 
 Write-LogSummary -ScriptName 'Invoke-Win11Debloat'
 Write-Host '  Reboot recommended.' -ForegroundColor Yellow
